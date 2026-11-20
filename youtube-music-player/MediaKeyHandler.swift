@@ -19,7 +19,6 @@ class MediaKeyHandler {
 
     init() {
         setupRemoteCommandCenter()
-        becomeNowPlaying()
     }
 
     func setViewModel(_ viewModel: YouTubeMusicViewModel) {
@@ -29,17 +28,15 @@ class MediaKeyHandler {
         }
     }
 
-    private func becomeNowPlaying() {
-        var nowPlayingInfo = [String: Any]()
-        nowPlayingInfo[MPMediaItemPropertyTitle] = "YouTube Music"
-        nowPlayingInfo[MPMediaItemPropertyArtist] = ""
-        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
-    }
-
     private func updateNowPlaying(title: String?, artist: String?, artworkUrl: URL?, isPlaying: Bool) {
-        var nowPlayingInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [String: Any]()
-        nowPlayingInfo[MPMediaItemPropertyTitle] = title ?? "YouTube Music"
+        guard let title, !title.isEmpty else {
+            clearNowPlaying()
+            return
+        }
+
+        let nowPlayingCenter = MPNowPlayingInfoCenter.default()
+        var nowPlayingInfo = nowPlayingCenter.nowPlayingInfo ?? [String: Any]()
+        nowPlayingInfo[MPMediaItemPropertyTitle] = title
         nowPlayingInfo[MPMediaItemPropertyArtist] = artist ?? ""
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
 
@@ -50,7 +47,8 @@ class MediaKeyHandler {
             artworkURL = newArtworkURL
             nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyArtwork)
         }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+        nowPlayingCenter.nowPlayingInfo = nowPlayingInfo
+        nowPlayingCenter.playbackState = isPlaying ? .playing : .paused
 
         guard artworkChanged, let newArtworkURL else { return }
         artworkTask = Task { [weak self, artworkSession] in
@@ -62,6 +60,15 @@ class MediaKeyHandler {
             updatedInfo[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
             MPNowPlayingInfoCenter.default().nowPlayingInfo = updatedInfo
         }
+    }
+
+    func clearNowPlaying() {
+        artworkTask?.cancel()
+        artworkTask = nil
+        artworkURL = nil
+        let nowPlayingCenter = MPNowPlayingInfoCenter.default()
+        nowPlayingCenter.nowPlayingInfo = nil
+        nowPlayingCenter.playbackState = .stopped
     }
 
     private static func isAllowedArtworkURL(_ url: URL) -> Bool {
@@ -98,14 +105,14 @@ class MediaKeyHandler {
 
         commandCenter.playCommand.addTarget { [weak self] _ in
             Task { @MainActor in
-                self?.viewModel?.playPause()
+                self?.viewModel?.play()
             }
             return .success
         }
 
         commandCenter.pauseCommand.addTarget { [weak self] _ in
             Task { @MainActor in
-                self?.viewModel?.playPause()
+                self?.viewModel?.pause()
             }
             return .success
         }

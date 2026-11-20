@@ -8,8 +8,7 @@
 import SwiftUI
 
 struct ContentView: View {
-    @State private var webViewModel = YouTubeMusicViewModel()
-    @State private var mediaKeyHandler = MediaKeyHandler()
+    let viewModel: YouTubeMusicViewModel
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,12 +16,9 @@ struct ContentView: View {
             WindowHeader()
                 .frame(height: 32)
 
-            YouTubeMusicWebView(viewModel: webViewModel)
+            YouTubeMusicWebView(viewModel: viewModel)
         }
         .ignoresSafeArea()
-        .onAppear {
-            mediaKeyHandler.setViewModel(webViewModel)
-        }
     }
 }
 
@@ -47,5 +43,5 @@ class DraggableHeaderView: NSView {
 }
 
 #Preview {
-    ContentView()
+    ContentView(viewModel: YouTubeMusicViewModel())
 }

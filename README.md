@@ -10,6 +10,7 @@ A lightweight native macOS wrapper for YouTube Music with system integration.
 - **Native macOS app** — No Electron, just a lean WebKit wrapper
 - **Media key support** — Control playback with your keyboard's play/pause, next, and previous keys
 - **Now Playing integration** — See track info in Control Center with album artwork
+- **Navigation shortcuts** — Go back with ⌘[, forward with ⌘], or reload with ⌘R
 - **Frameless design** — Clean, minimal window that blends with YouTube Music's UI
 - **Native scrollbars** — macOS-style scrollbars for a consistent look
 

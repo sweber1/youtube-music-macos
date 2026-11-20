@@ -5,7 +5,17 @@ import WebKit
 @MainActor
 class YouTubeMusicViewModel {
     weak var webView: WKWebView?
+    var canGoBack = false
+    var canGoForward = false
     var onTrackChange: ((String?, String?, URL?, Bool) -> Void)?
+
+    func play() {
+        clickPlayerButton("#play-pause-button", playing: true)
+    }
+
+    func pause() {
+        clickPlayerButton("#play-pause-button", playing: false)
+    }
 
     func playPause() {
         clickPlayerButton("#play-pause-button")
@@ -19,14 +29,17 @@ class YouTubeMusicViewModel {
         clickPlayerButton(".previous-button")
     }
 
-    private func clickPlayerButton(_ selector: String) {
+    private func clickPlayerButton(_ selector: String, playing: Bool? = nil) {
         webView?.callAsyncJavaScript(
             """
-            if (location.origin === 'https://music.youtube.com') {
-                document.querySelector(selector)?.click();
+            if (location.origin !== 'https://music.youtube.com') return;
+            if (playing !== null) {
+                const video = document.querySelector('video');
+                if (!video || (!video.paused && !video.ended) === playing) return;
             }
+            document.querySelector(selector)?.click();
             """,
-            arguments: ["selector": selector],
+            arguments: ["selector": selector, "playing": playing as Any? ?? NSNull()],
             in: nil,
             in: YouTubeMusicWebView.playerContentWorld,
             completionHandler: nil
@@ -94,21 +107,23 @@ struct YouTubeMusicWebView: NSViewRepresentable {
         let trackObserverJs = #"""
             (function() {
                 if (location.origin !== 'https://music.youtube.com') return;
-                let lastTitle = '';
-                let lastPlayState = null;
+                let player;
+                let lastTrack;
+                let updateTimer;
 
                 function sendTrackInfo() {
-                    const titleEl = document.querySelector('.title.ytmusic-player-bar, .title.style-scope.ytmusic-player-bar');
-                    const artistEl = document.querySelector('.byline.ytmusic-player-bar a, .subtitle .byline a');
-                    const imgEl = document.querySelector('.image.ytmusic-player-bar img, img.image.style-scope.ytmusic-player-bar');
+                    updateTimer = undefined;
+                    const titleEl = player?.querySelector('.title.ytmusic-player-bar');
+                    const artistEl = player?.querySelector('.byline.ytmusic-player-bar a, .subtitle .byline a');
+                    const imgEl = player?.querySelector('.image.ytmusic-player-bar img, img.image.style-scope.ytmusic-player-bar');
                     const video = document.querySelector('video');
 
                     const title = titleEl?.textContent?.trim() || '';
                     const artist = artistEl?.textContent?.trim() || '';
-                    const isPlaying = video ? !video.paused : false;
+                    const isPlaying = video ? !video.paused && !video.ended : false;
 
                     // Get larger artwork
-                    let artwork = imgEl?.src || '';
+                    let artwork = imgEl?.currentSrc || imgEl?.src || '';
                     if (artwork) {
                         artwork = artwork.replace(/=w\d+-h\d+-.*$/, '=w500-h500-l90-rj');
                         if (!artwork.includes('=w500')) {
@@ -116,35 +131,33 @@ struct YouTubeMusicWebView: NSViewRepresentable {
                         }
                     }
 
-                    // Send track info when title changes
-                    if (title && title !== lastTitle) {
-                        lastTitle = title;
-                        window.webkit.messageHandlers.trackInfo.postMessage({
-                            title: title,
-                            artist: artist,
-                            artwork: artwork,
-                            isPlaying: isPlaying
-                        });
-                    }
-
-                    // Send play state when it changes
-                    if (isPlaying !== lastPlayState) {
-                        lastPlayState = isPlaying;
-                        window.webkit.messageHandlers.trackInfo.postMessage({
-                            title: title || lastTitle,
-                            artist: artist,
-                            artwork: artwork,
-                            isPlaying: isPlaying
-                        });
-                    }
+                    if (lastTrack && title === lastTrack.title && artist === lastTrack.artist &&
+                        artwork === lastTrack.artwork && isPlaying === lastTrack.isPlaying) return;
+                    lastTrack = { title, artist, artwork, isPlaying };
+                    window.webkit.messageHandlers.trackInfo.postMessage(lastTrack);
                 }
 
-                // Check periodically for track changes
-                setInterval(sendTrackInfo, 500);
+                function scheduleUpdate() {
+                    if (updateTimer === undefined) updateTimer = setTimeout(sendTrackInfo, 50);
+                }
 
-                // Also observe DOM changes
-                const observer = new MutationObserver(sendTrackInfo);
-                observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+                const playerObserver = new MutationObserver(scheduleUpdate);
+                const playerDiscovery = new MutationObserver(attachPlayer);
+                function attachPlayer() {
+                    player = document.querySelector('ytmusic-player-bar');
+                    if (!player) return;
+                    playerDiscovery.disconnect();
+                    playerObserver.observe(player, {
+                        childList: true, subtree: true, characterData: true, attributeFilter: ['src', 'srcset']
+                    });
+                    scheduleUpdate();
+                }
+
+                for (const event of ['play', 'pause', 'ended', 'loadedmetadata', 'emptied']) {
+                    document.addEventListener(event, scheduleUpdate, true);
+                }
+                playerDiscovery.observe(document.body, { childList: true, subtree: true });
+                attachPlayer();
             })();
         """#
         let trackScript = WKUserScript(source: trackObserverJs, injectionTime: .atDocumentEnd,
@@ -158,6 +171,7 @@ struct YouTubeMusicWebView: NSViewRepresentable {
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 
         viewModel.webView = webView
+        context.coordinator.observeHistory(in: webView)
         webView.load(URLRequest(url: Self.homeURL))
 
         return webView
@@ -179,10 +193,23 @@ struct YouTubeMusicWebView: NSViewRepresentable {
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-        var viewModel: YouTubeMusicViewModel
+        private let viewModel: YouTubeMusicViewModel
+        private var historyObservations: [NSKeyValueObservation] = []
 
         init(viewModel: YouTubeMusicViewModel) {
             self.viewModel = viewModel
+        }
+
+        func observeHistory(in webView: WKWebView) {
+            historyObservations = [\WKWebView.canGoBack, \WKWebView.canGoForward].map { keyPath in
+                webView.observe(keyPath, options: [.initial, .new]) { [weak self] observedView, _ in
+                    Task { @MainActor [weak self, weak observedView] in
+                        guard let self, let observedView, self.viewModel.webView === observedView else { return }
+                        self.viewModel.canGoBack = observedView.canGoBack
+                        self.viewModel.canGoForward = observedView.canGoForward
+                    }
+                }
+            }
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
@@ -193,6 +220,10 @@ struct YouTubeMusicWebView: NSViewRepresentable {
         func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
             guard response.canShowMIMEType else { return .cancel }
             return !response.isForMainFrame || allowsMainFrameURL(response.response.url) ? .allow : .cancel
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            viewModel.onTrackChange?(nil, nil, nil, false)
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
