@@ -8,22 +8,39 @@ class YouTubeMusicViewModel {
     var onTrackChange: ((String?, String?, URL?, Bool) -> Void)?
 
     func playPause() {
-        let js = "document.querySelector('#play-pause-button')?.click();"
-        webView?.evaluateJavaScript(js)
+        clickPlayerButton("#play-pause-button")
     }
 
     func nextTrack() {
-        let js = "document.querySelector('.next-button')?.click();"
-        webView?.evaluateJavaScript(js)
+        clickPlayerButton(".next-button")
     }
 
     func previousTrack() {
-        let js = "document.querySelector('.previous-button')?.click();"
-        webView?.evaluateJavaScript(js)
+        clickPlayerButton(".previous-button")
+    }
+
+    private func clickPlayerButton(_ selector: String) {
+        webView?.callAsyncJavaScript(
+            """
+            if (location.origin === 'https://music.youtube.com') {
+                document.querySelector(selector)?.click();
+            }
+            """,
+            arguments: ["selector": selector],
+            in: nil,
+            in: YouTubeMusicWebView.playerContentWorld,
+            completionHandler: nil
+        )
     }
 }
 
 struct YouTubeMusicWebView: NSViewRepresentable {
+    static let homeURL = URL(string: "https://music.youtube.com")!
+    static let playerContentWorld = WKContentWorld.world(name: "YouTubeMusicPlayer")
+    private static let allowedHosts: Set<String> = [
+        "music.youtube.com", "accounts.google.com", "consent.youtube.com", "consent.google.com"
+    ]
+
     var viewModel: YouTubeMusicViewModel
 
     func makeNSView(context: Context) -> WKWebView {
@@ -31,11 +48,7 @@ struct YouTubeMusicWebView: NSViewRepresentable {
         config.allowsAirPlayForMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
 
-        // Make WebView appear more like a real browser
-        let prefs = WKWebpagePreferences()
-        prefs.allowsContentJavaScript = true
-        config.defaultWebpagePreferences = prefs
-        config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        config.preferences.javaScriptCanOpenWindowsAutomatically = false
 
         // Inject scrollbar CSS at document start
         let css = """
@@ -67,17 +80,20 @@ struct YouTubeMusicWebView: NSViewRepresentable {
         """
         let cssJs = """
             (function() {
+                if (location.origin !== 'https://music.youtube.com') return;
                 var style = document.createElement('style');
                 style.textContent = `\(css)`;
                 document.documentElement.appendChild(style);
             })();
         """
-        let cssScript = WKUserScript(source: cssJs, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        let cssScript = WKUserScript(source: cssJs, injectionTime: .atDocumentStart,
+                                     forMainFrameOnly: true, in: Self.playerContentWorld)
         config.userContentController.addUserScript(cssScript)
 
         // Track info observer script
         let trackObserverJs = #"""
             (function() {
+                if (location.origin !== 'https://music.youtube.com') return;
                 let lastTitle = '';
                 let lastPlayState = null;
 
@@ -131,20 +147,18 @@ struct YouTubeMusicWebView: NSViewRepresentable {
                 observer.observe(document.body, { childList: true, subtree: true, characterData: true });
             })();
         """#
-        let trackScript = WKUserScript(source: trackObserverJs, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let trackScript = WKUserScript(source: trackObserverJs, injectionTime: .atDocumentEnd,
+                                       forMainFrameOnly: true, in: Self.playerContentWorld)
         config.userContentController.addUserScript(trackScript)
-        config.userContentController.add(context.coordinator, name: "trackInfo")
+        config.userContentController.add(context.coordinator, contentWorld: Self.playerContentWorld, name: "trackInfo")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        // YouTube Music rejects the default WKWebView user agent.
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-        webView.setValue(false, forKey: "drawsBackground")
 
         viewModel.webView = webView
-
-        if let url = URL(string: "https://music.youtube.com") {
-            webView.load(URLRequest(url: url))
-        }
+        webView.load(URLRequest(url: Self.homeURL))
 
         return webView
     }
@@ -155,6 +169,15 @@ struct YouTubeMusicWebView: NSViewRepresentable {
         Coordinator(viewModel: viewModel)
     }
 
+    private static func allowsMainFrameURL(_ url: URL?) -> Bool {
+        guard let url, url.scheme == "https", let host = url.host(),
+              url.port == nil || url.port == 443,
+              url.user() == nil, url.password() == nil else { return false }
+        // Google returns to this endpoint before redirecting to YouTube Music.
+        if host == "www.youtube.com" { return url.path == "/signin" }
+        return allowedHosts.contains(host)
+    }
+
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var viewModel: YouTubeMusicViewModel
 
@@ -162,19 +185,28 @@ struct YouTubeMusicWebView: NSViewRepresentable {
             self.viewModel = viewModel
         }
 
-        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            if message.name == "trackInfo",
-               let body = message.body as? [String: Any] {
-                let title = body["title"] as? String
-                let artist = body["artist"] as? String
-                let artworkUrlString = body["artwork"] as? String
-                let artworkUrl = artworkUrlString.flatMap { URL(string: $0) }
-                let isPlaying = body["isPlaying"] as? Bool ?? false
+        func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
+            guard let frame = action.targetFrame, !action.shouldPerformDownload else { return .cancel }
+            return !frame.isMainFrame || allowsMainFrameURL(action.request.url) ? .allow : .cancel
+        }
 
-                Task { @MainActor in
-                    self.viewModel.onTrackChange?(title, artist, artworkUrl, isPlaying)
-                }
-            }
+        func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
+            guard response.canShowMIMEType else { return .cancel }
+            return !response.isForMainFrame || allowsMainFrameURL(response.response.url) ? .allow : .cancel
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            let origin = message.frameInfo.securityOrigin
+            guard message.name == "trackInfo", message.frameInfo.isMainFrame,
+                  origin.`protocol` == "https", origin.host == "music.youtube.com",
+                  origin.port == 0 || origin.port == 443,
+                  let body = message.body as? [String: Any] else { return }
+
+            let title = body["title"] as? String
+            let artist = body["artist"] as? String
+            let artworkURL = (body["artwork"] as? String).flatMap { URL(string: $0) }
+            let isPlaying = body["isPlaying"] as? Bool ?? false
+            viewModel.onTrackChange?(title, artist, artworkURL, isPlaying)
         }
     }
 }

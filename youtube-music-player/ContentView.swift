@@ -10,7 +10,6 @@ import SwiftUI
 struct ContentView: View {
     @State private var webViewModel = YouTubeMusicViewModel()
     @State private var mediaKeyHandler = MediaKeyHandler()
-    @State private var discordRPC = DiscordRPC()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,27 +22,6 @@ struct ContentView: View {
         .ignoresSafeArea()
         .onAppear {
             mediaKeyHandler.setViewModel(webViewModel)
-            setupDiscordPresence()
-        }
-    }
-
-    private func setupDiscordPresence() {
-        let existingCallback = webViewModel.onTrackChange
-
-        webViewModel.onTrackChange = { title, artist, artworkUrl, isPlaying in
-            // Call existing callback (for Now Playing)
-            existingCallback?(title, artist, artworkUrl, isPlaying)
-
-            // Update Discord presence
-            if let title = title, let artist = artist, isPlaying {
-                discordRPC.updatePresence(
-                    title: title,
-                    artist: artist,
-                    artworkUrl: artworkUrl?.absoluteString
-                )
-            } else if !isPlaying {
-                discordRPC.clearPresence()
-            }
         }
     }
 }
