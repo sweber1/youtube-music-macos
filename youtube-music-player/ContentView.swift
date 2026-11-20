@@ -17,6 +17,21 @@ struct ContentView: View {
                 .frame(height: 32)
 
             YouTubeMusicWebView(viewModel: viewModel)
+                .overlay {
+                    if let error = viewModel.navigationError {
+                        ContentUnavailableView {
+                            Label("YouTube Music", systemImage: "exclamationmark.circle")
+                        } description: {
+                            Text(error)
+                        } actions: {
+                            Button("Return to YouTube Music") { viewModel.goHome() }
+                                .buttonStyle(.borderedProminent)
+                            Button("Open in Browser") { NSWorkspace.shared.open(YouTubeMusicWebView.homeURL) }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(nsColor: .windowBackgroundColor))
+                    }
+                }
         }
         .ignoresSafeArea()
     }

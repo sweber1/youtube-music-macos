@@ -5,9 +5,11 @@ import AppKit
 @Observable
 @MainActor
 class MediaKeyHandler {
-    private var viewModel: YouTubeMusicViewModel?
+    private weak var viewModel: YouTubeMusicViewModel?
+    private(set) var artwork: NSImage?
     private var artworkURL: URL?
     private var artworkTask: Task<Void, Never>?
+    private let artworkCache = NSCache<NSURL, NSImage>()
     private let artworkSession: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
@@ -18,6 +20,7 @@ class MediaKeyHandler {
     }()
 
     init() {
+        artworkCache.countLimit = 12
         setupRemoteCommandCenter()
     }
 
@@ -45,17 +48,18 @@ class MediaKeyHandler {
         if artworkChanged {
             artworkTask?.cancel()
             artworkURL = newArtworkURL
+            artwork = nil
             nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyArtwork)
         }
         nowPlayingCenter.nowPlayingInfo = nowPlayingInfo
         nowPlayingCenter.playbackState = isPlaying ? .playing : .paused
 
         guard artworkChanged, let newArtworkURL else { return }
-        artworkTask = Task { [weak self, artworkSession] in
-            guard let data = try? await Self.loadArtwork(from: newArtworkURL, session: artworkSession),
-                  !Task.isCancelled, self?.artworkURL == newArtworkURL,
-                  let image = NSImage(data: data) else { return }
+        artworkTask = Task { [weak self] in
+            guard let self, let image = await self.fetchArtwork(from: newArtworkURL),
+                  !Task.isCancelled, self.artworkURL == newArtworkURL else { return }
 
+            self.artwork = image
             var updatedInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
             updatedInfo[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
             MPNowPlayingInfoCenter.default().nowPlayingInfo = updatedInfo
@@ -66,12 +70,22 @@ class MediaKeyHandler {
         artworkTask?.cancel()
         artworkTask = nil
         artworkURL = nil
+        artwork = nil
         let nowPlayingCenter = MPNowPlayingInfoCenter.default()
         nowPlayingCenter.nowPlayingInfo = nil
         nowPlayingCenter.playbackState = .stopped
     }
 
-    private static func isAllowedArtworkURL(_ url: URL) -> Bool {
+    func fetchArtwork(from url: URL) async -> NSImage? {
+        guard Self.isAllowedArtworkURL(url) else { return nil }
+        if let image = artworkCache.object(forKey: url as NSURL) { return image }
+        guard let data = try? await Self.loadArtwork(from: url, session: artworkSession),
+              !Task.isCancelled, let image = NSImage(data: data) else { return nil }
+        artworkCache.setObject(image, forKey: url as NSURL)
+        return image
+    }
+
+    static func isAllowedArtworkURL(_ url: URL) -> Bool {
         guard url.scheme == "https", url.port == nil || url.port == 443,
               url.user() == nil, url.password() == nil else { return false }
         switch url.host() {

@@ -4,10 +4,95 @@ import WebKit
 @Observable
 @MainActor
 class YouTubeMusicViewModel {
-    weak var webView: WKWebView?
+    @ObservationIgnored lazy var webView = YouTubeMusicWebView.makePlayer(for: self)
+    let mediaKeys = MediaKeyHandler()
     var canGoBack = false
     var canGoForward = false
+    var navigationError: String?
     var onTrackChange: ((String?, String?, URL?, Bool) -> Void)?
+    private(set) var trackTitle: String?
+    private(set) var trackArtist: String?
+    private(set) var isPlaying = false
+    private(set) var startingPlaylistID: String?
+    private(set) var playlistError: String?
+    @ObservationIgnored private var playlistTask: Task<Void, Never>?
+
+    init() {
+        mediaKeys.setViewModel(self)
+    }
+
+    func goHome() {
+        navigationError = nil
+        webView.load(URLRequest(url: YouTubeMusicWebView.homeURL))
+    }
+
+    func updateTrack(title: String?, artist: String?, artwork: URL?, playing: Bool) {
+        trackTitle = title.flatMap { $0.isEmpty ? nil : $0 }
+        trackArtist = artist.flatMap { $0.isEmpty ? nil : $0 }
+        isPlaying = playing
+        onTrackChange?(trackTitle, trackArtist, artwork, playing)
+    }
+
+    func playPlaylist(_ playlist: PinnedPlaylist, in store: PinnedPlaylists) {
+        playlistTask?.cancel()
+        let player = webView
+        startingPlaylistID = playlist.id
+        playlistError = nil
+        navigationError = nil
+        player.load(URLRequest(url: playlist.url))
+
+        playlistTask = Task { [weak self] in
+            do {
+                for _ in 0..<40 {
+                    try await Task.sleep(for: .milliseconds(250))
+                    guard !player.isLoading, player.url?.path() == "/playlist" else { continue }
+                    let result = try await player.callAsyncJavaScript(
+                        Self.startPlaylistScript,
+                        arguments: ["playlistID": playlist.id],
+                        in: nil,
+                        contentWorld: YouTubeMusicWebView.playerContentWorld
+                    )
+                    try Task.checkCancellation()
+                    guard let result = result as? [String: Any] else { continue }
+                    if let cover = result["artwork"] as? String, let url = URL(string: cover) {
+                        store.updateArtwork(url, for: playlist.id)
+                    }
+                    self?.startingPlaylistID = nil
+                    return
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+            }
+            self?.startingPlaylistID = nil
+            self?.playlistError = "Couldn’t start the playlist. Open the player to check access."
+        }
+    }
+
+    private static let startPlaylistScript = #"""
+        const page = new URL(location.href);
+        if (page.origin !== 'https://music.youtube.com' || page.pathname !== '/playlist' ||
+            page.searchParams.get('list') !== playlistID) return null;
+
+        const shelf = document.querySelector('ytmusic-playlist-shelf-renderer');
+        const rows = shelf?.querySelectorAll('ytmusic-responsive-list-item-renderer') ?? [];
+        for (const row of rows) {
+            if (row.hasAttribute('is-unplayable') || row.getAttribute('aria-disabled') === 'true') continue;
+            const link = row.querySelector('a[href*="watch?"]');
+            if (!link) continue;
+            const target = new URL(link.href);
+            if (target.origin !== page.origin || target.pathname !== '/watch' ||
+                target.searchParams.get('list') !== playlistID) continue;
+            const image = document.querySelector(
+                'ytmusic-responsive-header-renderer ytmusic-thumbnail-renderer img, ' +
+                'ytmusic-detail-header-renderer ytmusic-thumbnail-renderer img'
+            );
+            link.click();
+            return { artwork: image?.currentSrc || image?.src || '' };
+        }
+        return null;
+        """#
 
     func play() {
         clickPlayerButton("#play-pause-button", playing: true)
@@ -30,7 +115,7 @@ class YouTubeMusicViewModel {
     }
 
     private func clickPlayerButton(_ selector: String, playing: Bool? = nil) {
-        webView?.callAsyncJavaScript(
+        webView.callAsyncJavaScript(
             """
             if (location.origin !== 'https://music.youtube.com') return;
             if (playing !== null) {
@@ -56,7 +141,13 @@ struct YouTubeMusicWebView: NSViewRepresentable {
 
     var viewModel: YouTubeMusicViewModel
 
-    func makeNSView(context: Context) -> WKWebView {
+    func makeNSView(context: Context) -> NSView {
+        PlayerHostView(player: viewModel.webView)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    static func makePlayer(for viewModel: YouTubeMusicViewModel) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsAirPlayForMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -163,38 +254,38 @@ struct YouTubeMusicWebView: NSViewRepresentable {
         let trackScript = WKUserScript(source: trackObserverJs, injectionTime: .atDocumentEnd,
                                        forMainFrameOnly: true, in: Self.playerContentWorld)
         config.userContentController.addUserScript(trackScript)
-        config.userContentController.add(context.coordinator, contentWorld: Self.playerContentWorld, name: "trackInfo")
+        let coordinator = PlayerDelegate(viewModel: viewModel)
+        config.userContentController.add(coordinator, contentWorld: Self.playerContentWorld, name: "trackInfo")
 
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
+        webView.navigationDelegate = coordinator
         // YouTube Music rejects the default WKWebView user agent.
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 
-        viewModel.webView = webView
-        context.coordinator.observeHistory(in: webView)
+        coordinator.observeHistory(in: webView)
         webView.load(URLRequest(url: Self.homeURL))
 
         return webView
     }
 
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(viewModel: viewModel)
-    }
-
-    private static func allowsMainFrameURL(_ url: URL?) -> Bool {
+    static func allowsMainFrameURL(_ url: URL?) -> Bool {
         guard let url, url.scheme == "https", let host = url.host(),
               url.port == nil || url.port == 443,
               url.user() == nil, url.password() == nil else { return false }
-        // Google returns to this endpoint before redirecting to YouTube Music.
-        if host == "www.youtube.com" { return url.path == "/signin" }
-        return allowedHosts.contains(host)
+        switch host {
+        case "accounts.youtube.com":
+            return url.path(percentEncoded: true) == "/accounts/SetSID"
+        case "www.youtube.com":
+            return url.path(percentEncoded: true) == "/signin"
+        default:
+            return allowedHosts.contains(host)
+        }
     }
 
-    class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-        private let viewModel: YouTubeMusicViewModel
+    private final class PlayerDelegate: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        private weak var viewModel: YouTubeMusicViewModel?
         private var historyObservations: [NSKeyValueObservation] = []
+        private weak var currentNavigation: WKNavigation?
 
         init(viewModel: YouTubeMusicViewModel) {
             self.viewModel = viewModel
@@ -204,9 +295,9 @@ struct YouTubeMusicWebView: NSViewRepresentable {
             historyObservations = [\WKWebView.canGoBack, \WKWebView.canGoForward].map { keyPath in
                 webView.observe(keyPath, options: [.initial, .new]) { [weak self] observedView, _ in
                     Task { @MainActor [weak self, weak observedView] in
-                        guard let self, let observedView, self.viewModel.webView === observedView else { return }
-                        self.viewModel.canGoBack = observedView.canGoBack
-                        self.viewModel.canGoForward = observedView.canGoForward
+                        guard let observedView else { return }
+                        self?.viewModel?.canGoBack = observedView.canGoBack
+                        self?.viewModel?.canGoForward = observedView.canGoForward
                     }
                 }
             }
@@ -214,16 +305,52 @@ struct YouTubeMusicWebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
             guard let frame = action.targetFrame, !action.shouldPerformDownload else { return .cancel }
-            return !frame.isMainFrame || allowsMainFrameURL(action.request.url) ? .allow : .cancel
+            guard frame.isMainFrame else { return .allow }
+            if allowsMainFrameURL(action.request.url) { return .allow }
+            showBlockedSignInIfNeeded(in: webView)
+            return .cancel
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
             guard response.canShowMIMEType else { return .cancel }
-            return !response.isForMainFrame || allowsMainFrameURL(response.response.url) ? .allow : .cancel
+            guard response.isForMainFrame else { return .allow }
+            if allowsMainFrameURL(response.response.url) { return .allow }
+            showBlockedSignInIfNeeded(in: webView)
+            return .cancel
+        }
+
+        private func showBlockedSignInIfNeeded(in webView: WKWebView) {
+            guard let url = webView.backForwardList.currentItem?.url,
+                  allowsMainFrameURL(url), url.host() != homeURL.host() else { return }
+            viewModel?.navigationError = "The sign-in page could not return to YouTube Music."
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            currentNavigation = navigation
+            viewModel?.navigationError = nil
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            viewModel.onTrackChange?(nil, nil, nil, false)
+            viewModel?.updateTrack(title: nil, artist: nil, artwork: nil, playing: false)
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            showLoadFailure(for: navigation, error: error)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            showLoadFailure(for: navigation, error: error)
+        }
+
+        private func showLoadFailure(for navigation: WKNavigation?, error: Error) {
+            guard let navigation, currentNavigation === navigation, viewModel?.navigationError == nil,
+                  (error as? URLError)?.code != .cancelled else { return }
+            viewModel?.navigationError = "The page could not be loaded."
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            viewModel?.updateTrack(title: nil, artist: nil, artwork: nil, playing: false)
+            viewModel?.navigationError = "The player stopped responding."
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -237,7 +364,54 @@ struct YouTubeMusicWebView: NSViewRepresentable {
             let artist = body["artist"] as? String
             let artworkURL = (body["artwork"] as? String).flatMap { URL(string: $0) }
             let isPlaying = body["isPlaying"] as? Bool ?? false
-            viewModel.onTrackChange?(title, artist, artworkURL, isPlaying)
+            viewModel?.updateTrack(title: title, artist: artist, artwork: artworkURL, playing: isPlaying)
         }
+    }
+}
+
+private final class PlayerHostView: NSView {
+    private let closeDelegate = KeepPlayerWindowDelegate()
+
+    init(player: WKWebView) {
+        super.init(frame: .zero)
+        player.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(player)
+        NSLayoutConstraint.activate([
+            player.leadingAnchor.constraint(equalTo: leadingAnchor),
+            player.trailingAnchor.constraint(equalTo: trailingAnchor),
+            player.topAnchor.constraint(equalTo: topAnchor),
+            player.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.window === window,
+                  window.delegate !== self.closeDelegate else { return }
+            self.closeDelegate.original = window.delegate
+            window.delegate = self.closeDelegate
+        }
+    }
+}
+
+private final class KeepPlayerWindowDelegate: NSObject, NSWindowDelegate {
+    weak var original: (any NSWindowDelegate)?
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Keep the WebKit view attached so it can start another track in the background.
+        sender.orderOut(nil)
+        return false
+    }
+
+    override func responds(to selector: Selector!) -> Bool {
+        super.responds(to: selector) || original?.responds(to: selector) == true
+    }
+
+    override func forwardingTarget(for selector: Selector!) -> Any? {
+        original?.responds(to: selector) == true ? original : super.forwardingTarget(for: selector)
     }
 }

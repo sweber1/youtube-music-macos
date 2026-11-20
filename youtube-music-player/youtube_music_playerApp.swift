@@ -12,13 +12,11 @@ import WebKit
 struct youtube_music_playerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var viewModel = YouTubeMusicViewModel()
-    @State private var mediaKeyHandler = MediaKeyHandler()
+    @State private var playlists = PinnedPlaylists()
 
     var body: some Scene {
         Window("YouTube Music", id: "player") {
             ContentView(viewModel: viewModel)
-                .onAppear { mediaKeyHandler.setViewModel(viewModel) }
-                .onDisappear { mediaKeyHandler.clearNowPlaying() }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1200, height: 800)
@@ -29,17 +27,27 @@ struct youtube_music_playerApp: App {
                 }
             }
             CommandMenu("Navigate") {
-                Button("Back") { viewModel.webView?.goBack() }
+                Button("Back") { viewModel.webView.goBack() }
                     .keyboardShortcut("[", modifiers: .command)
                     .disabled(!viewModel.canGoBack)
-                Button("Forward") { viewModel.webView?.goForward() }
+                Button("Forward") { viewModel.webView.goForward() }
                     .keyboardShortcut("]", modifiers: .command)
                     .disabled(!viewModel.canGoForward)
                 Divider()
-                Button("Reload") { viewModel.webView?.reload() }
+                Button("Home") { viewModel.goHome() }
+                    .keyboardShortcut("h", modifiers: [.command, .shift])
+                Button("Reload") { viewModel.webView.reload() }
                     .keyboardShortcut("r", modifiers: .command)
-                    .disabled(viewModel.webView == nil)
             }
+        }
+
+        MenuBarExtra("YouTube Music", systemImage: "play.circle") {
+            MenuBarPlayer(player: viewModel, playlists: playlists)
+        }
+        .menuBarExtraStyle(.window)
+
+        Settings {
+            PlaylistSettingsView(store: playlists)
         }
     }
 }
@@ -47,11 +55,10 @@ struct youtube_music_playerApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         DispatchQueue.main.async {
-            if let window = NSApplication.shared.windows.first {
+            if let window = NSApplication.shared.windows.first(where: { $0.identifier?.rawValue == "player" }) {
                 window.titlebarAppearsTransparent = true
                 window.titleVisibility = .hidden
                 window.styleMask.insert(.fullSizeContentView)
-
             }
         }
     }

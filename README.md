@@ -11,6 +11,7 @@ A lightweight native macOS wrapper for YouTube Music with system integration.
 - **Media key support** — Control playback with your keyboard's play/pause, next, and previous keys
 - **Now Playing integration** — See track info in Control Center with album artwork
 - **Navigation shortcuts** — Go back with ⌘[, forward with ⌘], or reload with ⌘R
+- **Menu bar player** — See what’s playing, skip tracks, or start one of four pinned playlists
 - **Frameless design** — Clean, minimal window that blends with YouTube Music's UI
 - **Native scrollbars** — macOS-style scrollbars for a consistent look
 
@@ -19,6 +20,10 @@ A lightweight native macOS wrapper for YouTube Music with system integration.
 ![App](screenshots/youtube-app.png)
 
 ![Control Center](screenshots/control-center.png)
+
+## Pin playlists
+
+Click the play icon in the menu bar, then **Pin Playlists**. Add a name and a YouTube Music playlist link, then click **Save**. Each pin starts the first playable track in the playlist’s original order. Cover art appears when YouTube Music provides it.
 
 ## Build from source
 
